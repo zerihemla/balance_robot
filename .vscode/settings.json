@@ -3,6 +3,7 @@
         "stdio.h": "c",
         "rtosutility.h": "c",
         "stdlib.h": "c",
-        "semphr.h": "c"
+        "semphr.h": "c",
+        "pico.h": "c"
     }
 }
