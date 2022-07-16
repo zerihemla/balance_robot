@@ -19,4 +19,4 @@ bool mpu6050_find(void);
 
 void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp);
 
-int mpu6050_task();
+void mpu6050_task();

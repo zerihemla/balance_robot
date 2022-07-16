@@ -4,6 +4,7 @@
         "rtosutility.h": "c",
         "stdlib.h": "c",
         "semphr.h": "c",
-        "pico.h": "c"
+        "pico.h": "c",
+        "loginterface.h": "c"
     }
 }

@@ -1,5 +1,7 @@
+#pragma once
 #include <stdio.h>
 #include "pico/stdlib.h"
+#include "pico/binary_info.h"
 #include "hardware/i2c.h"
 
 // I2C address
@@ -30,3 +32,8 @@ int i2c_regRead(const uint addr,
                 const uint8_t reg,
                 uint8_t *buf,
                 const uint8_t nbytes);
+
+void i2c_busScan(void);
+
+
+void i2c_testTask();

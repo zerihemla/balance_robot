@@ -5,6 +5,8 @@
 #include "logInterface.h"
 #include "rtosUtility.h"
 
+#include "math.h"
+
 
 typedef enum
 {
@@ -18,7 +20,7 @@ typedef enum
     intPinConfig = 0x37,//1 byte
     intEnable = 0x38,   //1 byte
 
-    accelReg = 0x38,    //6 bytes
+    accelReg = 0x3B,    //6 bytes
     tempReg = 0x41,     //2 bytes
     gyroReg = 0x43,     //6 bytes
     whoAmI = 0x75,      //1 byte
@@ -59,20 +61,64 @@ typedef enum
 #define MPU_ADDR 0x68 
 #define MPU_WHO_AM_I_VALUE 0x68
 
-static bool _mpuFound = 0;
 
+#define MAX_PRINT_COUNT 15
+
+
+#define INT16_T_MAX 32767
+
+#define ACCEL_FULL_SCALE_VALUE (2.0f)
+#define GYRO_FULL_SCALE_VALUE  (250.0f) 
+
+
+#define ACCEL_SCALE_FACTOR (INT16_T_MAX / ACCEL_FULL_SCALE_VALUE)
+#define GYRO_SCALE_FACTOR  (INT16_T_MAX / GYRO_FULL_SCALE_VALUE)
+
+
+/////////LOCAL VARS//////////////
+static bool _mpuFound = 0;
+uint8_t _whoAmIRead = 0;
+
+uint8_t _printCount = 0;
+
+
+/////////LOCAL FUNCTION PROTOTYPES/////////
+static void _accelConvert(int16_t* inputAccel, float* outputAccel);
+static void _gyroConvert(int16_t* inputGyro, float* outputGyro);
+static void _tempConvert(int16_t* inputTemp, float* outputTemp);
+static void _printRawValues(int16_t* rawAcceleration, int16_t* rawGyro, int16_t rawTemp);
+static void _printConvertedValues(float* unitAcceleration, float* unitGyro, float unitTemp);
+static void _calculateAccelAngles(float* unitAccelInput, float* accelAngleOutput);
+static void _printAngles(float* accelAngleOutput);
+
+
+
+/////////////////////////////////////////////////////////
+////////////PUBLIC FUNCTIONS/////////////////////////////
+/////////////////////////////////////////////////////////
 void mpu6050_init(void)
 {
     _mpuFound = mpu6050_find();
 
     mpu6050_reset();
 
+    //if these set config values are changed, you also 
+    //need to change the FULL_SCALE_VALUE #defines.
+
+    //Set the flull scale range to +/- 250dps
+    uint8_t setGyroConfig = 0x00;
+
+    //Set the full scale range to +- 2g
+    uint8_t setAccelConfig = 0x00;
+
+    i2c_regWrite(MPU_ADDR, gyroConfig, &setGyroConfig, 1);
+    i2c_regWrite(MPU_ADDR, accelConfig, &setAccelConfig, 1);
+
     // #endif
 
 }
 
 
-#ifdef i2c_default
 void mpu6050_reset() 
 {
     // Two byte reset. First byte register, second byte data
@@ -81,10 +127,12 @@ void mpu6050_reset()
     i2c_write_blocking(i2c_default, MPU_ADDR, buf, 2, false);
 }
 
-bool mup6050_find(void)
+bool mpu6050_find(void)
 {
     uint8_t buffer [1];
     int numRead = i2c_regRead(MPU_ADDR, whoAmI, buffer, 1);
+
+    _whoAmIRead = buffer[0];
 
     if (numRead == 1)
     {
@@ -112,9 +160,12 @@ void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     //i2c_write_blocking(i2c_default, MPU_ADDR, &val, 1, true); // true to keep master control of bus
     //i2c_read_blocking(i2c_default, MPU_ADDR, buffer, 6, false);
 
+
+    uint8_t readIndex = 0;
     for (int i = 0; i < 3; i++) 
     {
-        accel[i] = (buffer[i * 2] << 8 | buffer[(i * 2) + 1]);
+        accel[i] = (buffer[readIndex] << 8 | buffer[readIndex + 1]);
+        readIndex += 2;
     }
 
     // Now gyro data from reg 0x43 for 6 bytes
@@ -122,9 +173,11 @@ void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     // i2c_write_blocking(i2c_default, MPU_ADDR, &val, 1, true);
     // i2c_read_blocking(i2c_default, MPU_ADDR, buffer, 6, false);  // False - finished with bus
 
+    readIndex = 0;
     for (int i = 0; i < 3; i++) 
     {
-        gyro[i] = (buffer[i * 2] << 8 | buffer[(i * 2) + 1]);;
+        gyro[i] = (buffer[readIndex] << 8 | buffer[readIndex + 1]);
+        readIndex += 2;
     }
 
     // Now temperature from reg 0x41 for 2 bytes
@@ -135,36 +188,130 @@ void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
 
     *temp = buffer[0] << 8 | buffer[1];
 }
-#endif
 
 
 
-int mpu6050_task() 
+void mpu6050_task() 
 {
-    int16_t acceleration[3], gyro[3], temp;
+    int16_t rawAcceleration[3], rawGyro[3], rawTemp;
+
+    float unitAcceleration[3], unitGyro[3], unitTemp;
+
+    float accelAngles[2];
+
 
     while (1) 
     {
         if(!_mpuFound)
         {
             log_printOutput("MPU6050 was not found in init!");
+            printf("%d Read Who Am I : %d", _whoAmIRead);
+            i2c_busScan();
             taskSleepMs(1000);
+            continue;
         }
 
-        mpu6050_read_raw(acceleration, gyro, &temp);
+        mpu6050_read_raw(rawAcceleration, rawGyro, &rawTemp);
+        
+        _accelConvert(rawAcceleration, unitAcceleration);
+        _gyroConvert(rawGyro, unitGyro);
+        _tempConvert(&rawTemp, &unitTemp);
 
-        // These are the raw numbers from the chip, so will need tweaking to be really useful.
-        // See the datasheet for more information
-        printf("Acc. X = %d, Y = %d, Z = %d\n", acceleration[0], acceleration[1], acceleration[2]);
-        printf("Gyro. X = %d, Y = %d, Z = %d\n", gyro[0], gyro[1], gyro[2]);
-        // Temperature is simple so use the datasheet calculation to get deg C.
-        // Note this is chip temperature.
-        printf("Temp. = %f\n", (temp / 340.0) + 36.53);
+
+        _calculateAccelAngles(unitAcceleration, accelAngles);
+
+        _printCount++;
+
+        if(_printCount >= MAX_PRINT_COUNT)
+        {
+            _printCount = 0;
+
+            printf("*****************************\n");
+            _printRawValues(rawAcceleration, rawGyro, rawTemp);
+            _printConvertedValues(unitAcceleration, unitGyro, unitTemp);
+            _printAngles(accelAngles);
+        }
 
         taskSleepMs(100);
     }
-
-
-    return 0;
 }
+
+
+
+/////////////////////////////////////////////////////
+/////////LOCAL FUNCTIONS/////////////////////////////
+/////////////////////////////////////////////////////
+
+//changes the units from raw to deg/sec
+static void _accelConvert(int16_t* inputAccel, float* outputAccel)
+{
+    for (int i = 0; i < 3; i ++)
+    {
+        outputAccel[i] = (float)inputAccel[i] / ACCEL_SCALE_FACTOR;
+    }
+    return;
+}
+
+
+//changes the units from raw to G's
+static void _gyroConvert(int16_t* inputGyro, float* outputGyro)
+{
+    for (int i = 0; i < 3; i ++)
+    {
+        outputGyro[i] = (float)inputGyro[i] / GYRO_SCALE_FACTOR;
+    }
+    return;
+}
+
+//changes the units to deg C
+static void _tempConvert(int16_t* inputTemp, float* outputTemp)
+{
+    *outputTemp = (*inputTemp / 340.0) + 36.53;
+}
+
+
+static void _printRawValues(int16_t* rawAcceleration, int16_t* rawGyro, int16_t rawTemp)
+{
+    // These are the raw numbers from the chip, so will need tweaking to be really useful.
+    // See the datasheet for more information
+    printf("RAW Acc. X = %d, Y = %d, Z = %d\n", rawAcceleration[0], rawAcceleration[1], rawAcceleration[2]);
+    printf("RAW Gyro. X = %d, Y = %d, Z = %d\n", rawGyro[0], rawGyro[1], rawGyro[2]);
+    // Temperature is simple so use the datasheet calculation to get deg C.
+    // Note this is chip temperature.
+    printf("RAW Temp. = %f\n\n", rawTemp);
+}
+
+static void _printConvertedValues(float* unitAcceleration, float* unitGyro, float unitTemp)
+{
+    printf("unit Acc. X = %.2f g, Y = %.2f g, Z = %.2f g\n", unitAcceleration[0], unitAcceleration[1], unitAcceleration[2]);
+    printf("unit Gyro. X = %.2f m/s2, Y = %.2f m/s2, Z = %.2f m/s2\n", unitGyro[0], unitGyro[1], unitGyro[2]);
+    printf("unit Temp. = %.2f C \n\n", unitTemp);
+}
+
+
+static void _calculateAccelAngles(float* unitAccelInput, float* accelAngleOutput)
+{
+
+    float x = unitAccelInput[0];
+    float y = unitAccelInput[1];
+    float z = unitAccelInput[2];
+
+    float x2 = x*x;
+    float y2 = y*y;
+    float z2 = z*z;
+
+    accelAngleOutput[0] = atan(x/(sqrt(y2 + z2)));
+    accelAngleOutput[1] = atan(y/(sqrt(x2 + z2)));
+
+    accelAngleOutput[0] = accelAngleOutput[0] * 180 / M_PI;
+    accelAngleOutput[1] = accelAngleOutput[1] * 180 / M_PI;
+}
+
+
+static void _printAngles(float* accelAngleOutput)
+{
+    printf("Accel. Angle X = %.2f, Y = %.2f\n", accelAngleOutput[0], accelAngleOutput[1]);
+}
+
+
 

@@ -8,15 +8,30 @@
 #include "led.h"
 #include "logInterface.h"
 #include "tester.h"
+#include "mpu6050.h"
+
+
+
+// #define I2C_SCAN
 
 
 
 
 void startTasks(void)
 {
+    //Normal Operation
     xTaskCreate(led_task, "LED_Task", 256, NULL, 1, NULL);
     xTaskCreate(testTask, "Tester_Task", 256, NULL, 1, NULL);
+    
+    #ifndef I2C_SCAN
+    xTaskCreate(mpu6050_task, "MPU6050_Task", 256, NULL, 1, NULL);
+    
+    //I2C Scan
+    #else
+    xTaskCreate(i2c_testTask, "I2C_Test", 256, NULL, 1, NULL);
 
+
+    #endif
 
     vTaskStartScheduler();
 }
@@ -39,7 +54,7 @@ void startupDelay(void)
 int main()
 {
     //Init all GPIO
-
+    stdio_init_all();
     //Init Functions
     // startupDelay();
 
@@ -47,10 +62,10 @@ int main()
     led_init();
 
     //Init the i2c
-    // i2c_interfaceInit();
+    i2c_interfaceInit();
 
-    stdio_init_all();
-
+    //init the Gyro/Accel
+    mpu6050_init();
 
     //Start Tasks
     startTasks();

@@ -36,7 +36,7 @@ void led_init(void)
     _lastTime = taskGetTimeMs();
     _taskSwitchTime = taskGetTimeMs();
 
-    _ledMutex = xSemaphoreCreateBinary();
+    // _ledMutex = xSemaphoreCreateBinary();
 
     onboardLedState_t _curOnboardLedState = LED_STATE_INIT;
 }
@@ -56,18 +56,18 @@ void led_task()
 
 void led_setOnboardLedState(onboardLedState_t newLedState)
 {
-    MUTEX_LOCK(_ledMutex);
-    log_printOutput("New Led State!");
+    // MUTEX_LOCK(_ledMutex);
+    // log_printOutput("New Led State!");
     _curOnboardLedState = newLedState;
-    MUTEX_UNLOCK(_ledMutex);
+    // MUTEX_UNLOCK(_ledMutex);
 }
 
 onboardLedState_t led_getOnboardLedState(void)
 {
     onboardLedState_t retVal = 0;
-    MUTEX_LOCK(_ledMutex);
+    // MUTEX_LOCK(_ledMutex);
     retVal = _curOnboardLedState;
-    MUTEX_UNLOCK(_ledMutex);
+    // MUTEX_UNLOCK(_ledMutex);
     return retVal;
 }
 
