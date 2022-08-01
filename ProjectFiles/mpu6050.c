@@ -10,9 +10,8 @@
 #include "hardware/gpio.h" //used to create the GPIO interrupt
 #include "semphr.h"
 
-#include "math.h"
-
-
+#include "math.h"   //for angle conversion in accel angle calc
+#include <stdlib.h> //to use abs
 
 typedef enum
 {
@@ -83,6 +82,8 @@ typedef enum
 
 #define CHIP_SEM_READ_TIME 100
 
+#define ACCEPTABLE_INTERRUPT_VARIANCE_MS 5
+
 //The weights into the kalman filter
 #define ACCEL_TRUST_FACTOR 0.05
 #define GYRO_TRUST_FACTOR 1 - ACCEL_TRUST_FACTOR
@@ -96,6 +97,7 @@ uint8_t _printCount = 0;
 static SemaphoreHandle_t _chipReadSem = NULL;
 uint32_t _curSensorReadTimeMs = 0;
 uint32_t _lastSensorReadTimeMs = 0;
+uint32_t _normalInterruptTime = 0;
 
 
 
@@ -114,6 +116,8 @@ static void _printAngles(float* accelAngleOutput, float* gyroAngleOutput, float*
 static void _calculateAccelAngles(float* unitAccelInput, float* accelAngleOutput);
 static void _calculateGyroAngles(float* unitGyro, float* lastAngles, float* gyroAngleOutput);
 static void _combineAngles(float* accelAngles, float* gyroAngles, float* filteredAngles);
+
+static void _updateNormalInterruptTime(uint32_t newTimeDeltaMs);
 
 //interrupt fucntions
 static void _interruptCallback(uint gpio, uint32_t events);
@@ -397,6 +401,8 @@ static void _calculateGyroAngles(float* unitGyro, float* lastAngles, float* gyro
     uint32_t timeDeltaMs = _curSensorReadTimeMs - _lastSensorReadTimeMs;
     float timeDeltaSec = ((float) timeDeltaMs / 1000);
 
+    _updateNormalInterruptTime(timeDeltaMs);
+
 
     //I dont know if this is the right gyro axis here, it should be re-examined.
     gyroAngleOutput[0] = lastAngles[0] + (unitGyro[0] * timeDeltaSec);
@@ -418,6 +424,24 @@ static void _combineAngles(float* accelAngles, float* gyroAngles, float* filtere
     for (int i = 0; i < 2; i ++)
     {
         filteredAngles[i] = (ACCEL_TRUST_FACTOR * accelAngles[i]) + (GYRO_TRUST_FACTOR * gyroAngles[i]);
+    }
+}
+
+static void _updateNormalInterruptTime(uint32_t newTimeDeltaMs)
+{
+    //Set what a normal interrupt time is.
+    if(_normalInterruptTime == 0)
+    {
+        _normalInterruptTime = newTimeDeltaMs;
+        return;
+    }
+
+    int norm = _normalInterruptTime;
+    int new = newTimeDeltaMs;
+
+    if (abs(norm - new) > ACCEPTABLE_INTERRUPT_VARIANCE_MS)
+    {
+        printf("INTERRUPT ALERT!!! Norm: %u  Cur: %u", _normalInterruptTime, newTimeDeltaMs);
     }
 }
 

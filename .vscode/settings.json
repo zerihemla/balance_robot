@@ -5,6 +5,11 @@
         "stdlib.h": "c",
         "semphr.h": "c",
         "pico.h": "c",
-        "loginterface.h": "c"
+        "loginterface.h": "c",
+        "cmath": "c",
+        "*.tcc": "c",
+        "cinttypes": "c",
+        "cstdlib": "c",
+        "math.h": "c"
     }
 }
