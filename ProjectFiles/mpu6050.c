@@ -4,26 +4,33 @@
 #include "hardware/i2c.h"
 #include "logInterface.h"
 #include "rtosUtility.h"
+#include "pinout.h"
+
+
+#include "hardware/gpio.h" //used to create the GPIO interrupt
+#include "semphr.h"
 
 #include "math.h"
 
 
+
 typedef enum
 {
-    selfTestX = 0x0D,   //1 byte
-    selfTestY = 0x0E,   //1 byte
-    selfTestZ = 0x0F,   //1 byte
+    SELF_TEST_X_REG = 0x0D,    //1 byte
+    SELF_TEST_Y_REG = 0x0E,    //1 byte
+    SELF_TEST_Z_REG = 0x0F,    //1 byte
     
-    gyroConfig = 0x1B,  //1 byte
-    accelConfig = 0x1C, //1 byte
+    GYRO_CONFIG_REG = 0x1B,    //1 byte
+    ACCEL_CONFIG_REG = 0x1C,   //1 byte
 
-    intPinConfig = 0x37,//1 byte
-    intEnable = 0x38,   //1 byte
+    INT_PIN_CONFIG_REG = 0x37, //1 byte
+    INT_ENABLE_REG = 0x38,     //1 byte
 
-    accelReg = 0x3B,    //6 bytes
-    tempReg = 0x41,     //2 bytes
-    gyroReg = 0x43,     //6 bytes
-    whoAmI = 0x75,      //1 byte
+    ACCEL_REG = 0x3B,          //6 bytes
+    TEMP_REG = 0x41,           //2 bytes
+    GYRO_REG = 0x43,           //6 bytes
+
+    WHO_AM_I_REG = 0x75,       //1 byte
 
 }mpu6050Reg_t;
 
@@ -74,6 +81,11 @@ typedef enum
 #define ACCEL_SCALE_FACTOR (INT16_T_MAX / ACCEL_FULL_SCALE_VALUE)
 #define GYRO_SCALE_FACTOR  (INT16_T_MAX / GYRO_FULL_SCALE_VALUE)
 
+#define CHIP_SEM_READ_TIME 100
+
+//The weights into the kalman filter
+#define ACCEL_TRUST_FACTOR 0.05
+#define GYRO_TRUST_FACTOR 1 - ACCEL_TRUST_FACTOR
 
 /////////LOCAL VARS//////////////
 static bool _mpuFound = 0;
@@ -81,15 +93,31 @@ uint8_t _whoAmIRead = 0;
 
 uint8_t _printCount = 0;
 
+static SemaphoreHandle_t _chipReadSem = NULL;
+uint32_t _curSensorReadTimeMs = 0;
+uint32_t _lastSensorReadTimeMs = 0;
+
+
 
 /////////LOCAL FUNCTION PROTOTYPES/////////
+//converting functions
 static void _accelConvert(int16_t* inputAccel, float* outputAccel);
 static void _gyroConvert(int16_t* inputGyro, float* outputGyro);
 static void _tempConvert(int16_t* inputTemp, float* outputTemp);
+
+//printing functions
 static void _printRawValues(int16_t* rawAcceleration, int16_t* rawGyro, int16_t rawTemp);
 static void _printConvertedValues(float* unitAcceleration, float* unitGyro, float unitTemp);
+static void _printAngles(float* accelAngleOutput, float* gyroAngleOutput, float* filteredAngleOutput);
+
+//calculate angle functions
 static void _calculateAccelAngles(float* unitAccelInput, float* accelAngleOutput);
-static void _printAngles(float* accelAngleOutput);
+static void _calculateGyroAngles(float* unitGyro, float* lastAngles, float* gyroAngleOutput);
+static void _combineAngles(float* accelAngles, float* gyroAngles, float* filteredAngles);
+
+//interrupt fucntions
+static void _interruptCallback(uint gpio, uint32_t events);
+void _getEventString(char *buf, uint32_t events);
 
 
 
@@ -111,11 +139,27 @@ void mpu6050_init(void)
     //Set the full scale range to +- 2g
     uint8_t setAccelConfig = 0x00;
 
-    i2c_regWrite(MPU_ADDR, gyroConfig, &setGyroConfig, 1);
-    i2c_regWrite(MPU_ADDR, accelConfig, &setAccelConfig, 1);
+    //Sets the interrupt to fire when there is data ready.
+    uint8_t interruptEnableConfig = 0x01;
 
-    // #endif
+    //sets the interrupt to be high, and stay till a read happens.
+    uint8_t interruptConfig = 0x30;
 
+    //set the int pin as a input pint
+    gpio_set_dir(MPU_INT_PIN, 0);
+
+    i2c_regWrite(MPU_ADDR, GYRO_CONFIG_REG, &setGyroConfig, 1);
+    i2c_regWrite(MPU_ADDR, ACCEL_CONFIG_REG, &setAccelConfig, 1);
+
+    i2c_regWrite(MPU_ADDR, INT_ENABLE_REG, &interruptEnableConfig, 1);
+    i2c_regWrite(MPU_ADDR, INT_PIN_CONFIG_REG, &interruptConfig, 1);
+
+    if (_mpuFound)
+    {
+        gpio_set_irq_enabled_with_callback(MPU_INT_PIN, GPIO_IRQ_EDGE_RISE, true, &_interruptCallback);
+    }
+
+    _chipReadSem = xSemaphoreCreateBinary();
 }
 
 
@@ -130,7 +174,7 @@ void mpu6050_reset()
 bool mpu6050_find(void)
 {
     uint8_t buffer [1];
-    int numRead = i2c_regRead(MPU_ADDR, whoAmI, buffer, 1);
+    int numRead = i2c_regRead(MPU_ADDR, WHO_AM_I_REG, buffer, 1);
 
     _whoAmIRead = buffer[0];
 
@@ -149,6 +193,7 @@ bool mpu6050_find(void)
 
 void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) 
 {
+    _lastSensorReadTimeMs = _curSensorReadTimeMs;
     // For this particular device, we send the device the register we want to read
     // first, then subsequently read from the device. The register is auto incrementing
     // so we don't need to keep sending the register we want, just the first.
@@ -156,7 +201,7 @@ void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     uint8_t buffer[6];
 
     // Start reading acceleration registers from register 0x3B for 6 bytes
-    i2c_regRead(MPU_ADDR, accelReg, buffer, 6);
+    i2c_regRead(MPU_ADDR, ACCEL_REG, buffer, 6);
     //i2c_write_blocking(i2c_default, MPU_ADDR, &val, 1, true); // true to keep master control of bus
     //i2c_read_blocking(i2c_default, MPU_ADDR, buffer, 6, false);
 
@@ -169,7 +214,7 @@ void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     }
 
     // Now gyro data from reg 0x43 for 6 bytes
-    i2c_regRead(MPU_ADDR, gyroReg, buffer, 6);
+    i2c_regRead(MPU_ADDR, GYRO_REG, buffer, 6);
     // i2c_write_blocking(i2c_default, MPU_ADDR, &val, 1, true);
     // i2c_read_blocking(i2c_default, MPU_ADDR, buffer, 6, false);  // False - finished with bus
 
@@ -187,6 +232,8 @@ void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     // i2c_read_blocking(i2c_default, MPU_ADDR, buffer, 2, false);  // False - finished with bus
 
     *temp = buffer[0] << 8 | buffer[1];
+
+    _curSensorReadTimeMs = taskGetTimeMs();
 }
 
 
@@ -197,7 +244,7 @@ void mpu6050_task()
 
     float unitAcceleration[3], unitGyro[3], unitTemp;
 
-    float accelAngles[2];
+    float accelAngles[2], gyroAngles[2], filteredAngles[2], lastAngles[2];
 
 
     while (1) 
@@ -211,17 +258,35 @@ void mpu6050_task()
             continue;
         }
 
+        //Wait till a measurment is signlaed by hte interrupt.
+        xSemaphoreTake(_chipReadSem, CHIP_SEM_READ_TIME);
+
+
+
+        //Read from the sensor
         mpu6050_read_raw(rawAcceleration, rawGyro, &rawTemp);
         
+
+
+        //Convert Mesaurements to something useful
         _accelConvert(rawAcceleration, unitAcceleration);
         _gyroConvert(rawGyro, unitGyro);
         _tempConvert(&rawTemp, &unitTemp);
 
 
+
+        //Calculate the angles
+        lastAngles[0] = filteredAngles[0];
+        lastAngles[1] = filteredAngles[1];
+
         _calculateAccelAngles(unitAcceleration, accelAngles);
+        _calculateGyroAngles(unitGyro, lastAngles, gyroAngles);
 
+        _combineAngles(accelAngles, gyroAngles, filteredAngles);
+
+
+        //Print out the angles.
         _printCount++;
-
         if(_printCount >= MAX_PRINT_COUNT)
         {
             _printCount = 0;
@@ -229,10 +294,12 @@ void mpu6050_task()
             printf("*****************************\n");
             _printRawValues(rawAcceleration, rawGyro, rawTemp);
             _printConvertedValues(unitAcceleration, unitGyro, unitTemp);
-            _printAngles(accelAngles);
+            
+            _printAngles(accelAngles, gyroAngles, filteredAngles);
         }
 
-        taskSleepMs(100);
+        //Waits are bad. DOnt wait.
+        // taskSleepMs(100);
     }
 }
 
@@ -241,6 +308,8 @@ void mpu6050_task()
 /////////////////////////////////////////////////////
 /////////LOCAL FUNCTIONS/////////////////////////////
 /////////////////////////////////////////////////////
+
+////CONVERT FUNCTIONS////
 
 //changes the units from raw to deg/sec
 static void _accelConvert(int16_t* inputAccel, float* outputAccel)
@@ -252,7 +321,6 @@ static void _accelConvert(int16_t* inputAccel, float* outputAccel)
     return;
 }
 
-
 //changes the units from raw to G's
 static void _gyroConvert(int16_t* inputGyro, float* outputGyro)
 {
@@ -263,12 +331,14 @@ static void _gyroConvert(int16_t* inputGyro, float* outputGyro)
     return;
 }
 
-//changes the units to deg C
+//changes the units from raw to deg C
 static void _tempConvert(int16_t* inputTemp, float* outputTemp)
 {
     *outputTemp = (*inputTemp / 340.0) + 36.53;
 }
 
+
+////PRINT FUNCTIONS/////
 
 static void _printRawValues(int16_t* rawAcceleration, int16_t* rawGyro, int16_t rawTemp)
 {
@@ -288,6 +358,15 @@ static void _printConvertedValues(float* unitAcceleration, float* unitGyro, floa
     printf("unit Temp. = %.2f C \n\n", unitTemp);
 }
 
+static void _printAngles(float* accelAngleOutput, float* gyroAngleOutput, float* filteredAngleOutput)
+{
+    printf("Accel: Angle X = %.2f, Y = %.2f\n", accelAngleOutput[0], accelAngleOutput[1]);
+    printf("Gyro:  Angle X = %.2f, Y = %.2f\n", gyroAngleOutput[0], gyroAngleOutput[1]);
+    printf("Filt:  Angle X = %.2f, Y = %.2f\n", filteredAngleOutput[0], filteredAngleOutput[1]);
+}
+
+
+////CALCULATE ANGLE FUNCTIONS////
 
 static void _calculateAccelAngles(float* unitAccelInput, float* accelAngleOutput)
 {
@@ -307,11 +386,86 @@ static void _calculateAccelAngles(float* unitAccelInput, float* accelAngleOutput
     accelAngleOutput[1] = accelAngleOutput[1] * 180 / M_PI;
 }
 
-
-static void _printAngles(float* accelAngleOutput)
+static void _calculateGyroAngles(float* unitGyro, float* lastAngles, float* gyroAngleOutput)
 {
-    printf("Accel. Angle X = %.2f, Y = %.2f\n", accelAngleOutput[0], accelAngleOutput[1]);
+    if(_lastSensorReadTimeMs == 0)
+    {
+        //This is the first time through the loop. We cant calculate gyro angles.
+        return;
+    }
+    
+    uint32_t timeDeltaMs = _curSensorReadTimeMs - _lastSensorReadTimeMs;
+    float timeDeltaSec = ((float) timeDeltaMs / 1000);
+
+
+    //I dont know if this is the right gyro axis here, it should be re-examined.
+    gyroAngleOutput[0] = lastAngles[0] + (unitGyro[0] * timeDeltaSec);
+    gyroAngleOutput[1] = lastAngles[1] + (unitGyro[1] * timeDeltaSec);
 }
 
 
+static void _combineAngles(float* accelAngles, float* gyroAngles, float* filteredAngles)
+{
+    if (_lastSensorReadTimeMs == 0)
+    {
+        //This is the first time reading the sensor. The gyro wont have calculated angles yet.
+        filteredAngles[0] = accelAngles[0];
+        filteredAngles[1] = accelAngles[1];
+        return;
+    }
+
+
+    for (int i = 0; i < 2; i ++)
+    {
+        filteredAngles[i] = (ACCEL_TRUST_FACTOR * accelAngles[i]) + (GYRO_TRUST_FACTOR * gyroAngles[i]);
+    }
+}
+
+
+////INTERRUPT HANDLER CODE////
+
+static void _interruptCallback(uint gpio, uint32_t events) 
+{
+    //The next three lines are only for debugging.
+    
+    // static char event_str[128];
+    // _getEventString(event_str, events);
+    // printf("GPIO %d %s\n", gpio, event_str);
+
+    //Give the semaphore from ISR
+    //I probably need to make a semaphore first....
+    
+    BaseType_t taskWoke = 0; //I dont know what this does...
+    xSemaphoreGiveFromISR(_chipReadSem, &taskWoke);
+}
+
+static const char *gpio_irq_str[] = 
+{
+        "LEVEL_LOW",  // 0x1
+        "LEVEL_HIGH", // 0x2
+        "EDGE_FALL",  // 0x4
+        "EDGE_RISE"   // 0x8
+};
+
+void _getEventString(char *buf, uint32_t events) 
+{
+    for (uint i = 0; i < 4; i++) {
+        uint mask = (1 << i);
+        if (events & mask) {
+            // Copy this event string into the user string
+            const char *event_str = gpio_irq_str[i];
+            while (*event_str != '\0') {
+                *buf++ = *event_str++;
+            }
+            events &= ~mask;
+
+            // If more events add ", "
+            if (events) {
+                *buf++ = ',';
+                *buf++ = ' ';
+            }
+        }
+    }
+    *buf++ = '\0';
+}
 
