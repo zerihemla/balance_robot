@@ -6,7 +6,6 @@
 #include "rtosUtility.h"
 #include "pinout.h"
 
-
 #include "hardware/gpio.h" //used to create the GPIO interrupt
 #include "semphr.h"
 
@@ -68,7 +67,7 @@ typedef enum
 #define MPU_WHO_AM_I_VALUE 0x68
 
 
-#define MAX_PRINT_COUNT 15
+#define MAX_PRINT_COUNT 5
 
 
 #define INT16_T_MAX 32767
@@ -85,8 +84,10 @@ typedef enum
 #define ACCEPTABLE_INTERRUPT_VARIANCE_MS 5
 
 //The weights into the kalman filter
-#define ACCEL_TRUST_FACTOR 0.05
-#define GYRO_TRUST_FACTOR 1 - ACCEL_TRUST_FACTOR
+#define ACCEL_TRUST_FACTOR 0.05f
+#define GYRO_TRUST_FACTOR 0.95f
+// #define GYRO_TRUST_FACTOR 1.0f - ACCEL_TRUST_FACTOR
+
 
 /////////LOCAL VARS//////////////
 static bool _mpuFound = 0;
@@ -296,8 +297,8 @@ void mpu6050_task()
             _printCount = 0;
 
             printf("*****************************\n");
-            _printRawValues(rawAcceleration, rawGyro, rawTemp);
-            _printConvertedValues(unitAcceleration, unitGyro, unitTemp);
+            // _printRawValues(rawAcceleration, rawGyro, rawTemp);
+            // _printConvertedValues(unitAcceleration, unitGyro, unitTemp);
             
             _printAngles(accelAngles, gyroAngles, filteredAngles);
         }
@@ -405,8 +406,8 @@ static void _calculateGyroAngles(float* unitGyro, float* lastAngles, float* gyro
 
 
     //I dont know if this is the right gyro axis here, it should be re-examined.
-    gyroAngleOutput[0] = lastAngles[0] + (unitGyro[0] * timeDeltaSec);
-    gyroAngleOutput[1] = lastAngles[1] + (unitGyro[1] * timeDeltaSec);
+    gyroAngleOutput[0] = lastAngles[0] + (-unitGyro[1] * timeDeltaSec);
+    gyroAngleOutput[1] = lastAngles[1] + (unitGyro[0] * timeDeltaSec);
 }
 
 
@@ -492,4 +493,3 @@ void _getEventString(char *buf, uint32_t events)
     }
     *buf++ = '\0';
 }
-
